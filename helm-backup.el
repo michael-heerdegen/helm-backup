@@ -1,11 +1,11 @@
 ;;; helm-backup.el --- Backup each file change using git
 
-;; Copyright (C) 2013 Anthony HAMON
+;; Copyright (C) 2013-2015 Anthony HAMON
 
 ;; Author: Anthony HAMON <hamon.anth@gmail.com>
 ;; URL: http://github.com/antham/helm-backup
-;; Version: 0.2.0
-;; Package-Requires: ((helm "1.5.5") (s "1.8.0"))
+;; Version: 0.3.0
+;; Package-Requires: ((helm "1.5.5"))
 ;; Keywords: backup
 
 ;; This program is free software; you can redistribute it and/or modify
@@ -32,29 +32,45 @@
 ;; M-x helm-backup
 ;; for convenience you can define key binding as follow :
 ;; (global-set-key (kbd "C-c b") 'helm-backup)
+;;
+;; To do:
+;;
+;; - I there a mean in git to create a tree object without using the
+;; index?
+;;
+;; - Provide a command to allow deletion of files from history.
+;;
+;; - split into two files: the helm interface, and the backup mechanism
+
 
 ;;; Code:
 
 (require 'helm)
 (require 'helm-utils)
-(require 'cl)
-(require 's)
+(require 'cl-lib)
+
 
 (defgroup helm-backup nil
   "Backup system using git and helm."
   :group 'helm)
 
-(defcustom helm-backup-path "~/.helm-backup"
+(defcustom helm-backup-path (expand-file-name "~/.helm-backup/")
   "Backup location."
   :group 'helm-backup
   :type 'string)
 
-(defcustom helm-backup-git-binary "/usr/bin/git"
+(defvar helm-backup-use-hardlinks t)
+
+(defvar helm-backup-namespace "refs/backup/")
+
+(defvar helm-backup-ref "all")
+
+(defcustom helm-backup-git-binary (executable-find "git")
   "Git binary path."
   :group 'helm-backup
   :type 'string)
 
-(defcustom helm-backup-list-format "%cd, %ar"
+(defcustom helm-backup-list-format "%cd: %s  (%ar)"
   "Format use to display entries in helm buffer, follow git log format."
   :group 'helm-backup
   :type 'string)
@@ -68,115 +84,216 @@
   :group 'helm-backup
   :type '(repeat regexp))
 
+(defvar magit-backup-respect-git-branches t)
+
+(defmacro helm-backup-in-backup-path (&rest body)
+  (declare (debug t))
+  `(let ((default-directory helm-backup-path))
+     ,@body))
+
+(defun magit-backup--strip-final-newline (output)
+  (string-match (rx bos (group (*? anything)) (* (any "\n\r")) eos) output)
+  (match-string 1 output)  )
+
+(defun helm-backup-exec-git-command (command &rest args)
+  "Execute git COMMAND and return result string, nil if failed."
+  (let ((keep-final-newline nil))
+    (when (memq 'keep-final-newline args)
+      (setq keep-final-newline t
+            args (delq 'keep-final-newline args)))
+    (when-let ((output (with-temp-buffer
+                         (when (zerop
+                                (apply #'process-file helm-backup-git-binary nil t nil command args))
+                           (buffer-string)))))
+      (if keep-final-newline
+          output
+        (magit-backup--strip-final-newline output)))))
+
+(defun helm-backup-git-command-return-value (command &rest args)
+  (helm-backup-in-backup-path
+    (apply #'process-file helm-backup-git-binary nil nil nil command args)))
+
+(defun helm-backup-get-ref (file)
+  (let ((default-directory (file-name-directory file)))
+    (concat helm-backup-namespace
+            (or (and magit-backup-respect-git-branches
+                     (require 'vc nil t)
+                     (vc-git-registered file)
+                     (concat "brances/"
+                             (file-name-nondirectory
+                              (helm-backup-exec-git-command "symbolic-ref" "--quiet" "HEAD"))))
+                helm-backup-ref))))
+
 (defun helm-backup-init-git-repository ()
   "Initialize git repository."
   (unless (file-directory-p helm-backup-path)
-    (call-process-shell-command helm-backup-git-binary nil nil nil "init" helm-backup-path)
-    (helm-backup-exec-git-command (list "config" "--local" "user.email" "noemail@noemail.com"))
-    (helm-backup-exec-git-command (list "config" "--local" "user.name" "noname"))))
-
-(defun helm-backup-exec-git-command (command &optional strip-last-newline)
-  "Execute a git COMMAND inside backup repository, optionally STRIP-LAST-NEWLINE."
-  (when (file-directory-p (concat helm-backup-path "/.git"))
-    (let ((output (shell-command-to-string (combine-and-quote-strings (append (list "cd"
-                                                                                    helm-backup-path
-                                                                                    "&&" "git")
-                                                                              command)))))
-      (if strip-last-newline
-          (s-chomp output)
-        output))))
+    (helm-backup-exec-git-command "init" helm-backup-path)
+    (helm-backup-in-backup-path
+      (helm-backup-exec-git-command "config" "--local" "user.email" "noemail@noemail.com")
+      (helm-backup-exec-git-command "config" "--local" "user.name" "noname"))))
 
 (defun helm-backup-transform-filename-for-git (filename)
   "Transform FILENAME to be used in git repository."
-  (when (and filename
-             (helm-backup-is-absolute-filename filename))
-    (substring filename 1)))
-
-(defun helm-backup-is-absolute-filename (filename)
-  "Check if a FILENAME is absolute or not."
-  (when (and filename
-             (string= (substring filename 0 1) "/"))
-    t))
+  (when (and filename (file-name-absolute-p filename))
+    (file-relative-name filename "/")))
 
 (defun helm-backup-copy-file-to-repository (filename)
   "Create folder in repository and copy file using FILENAME in it."
-  (let ((directory (concat helm-backup-path (file-name-directory filename))))
+  (let ((directory (expand-file-name (file-name-directory
+                                      (helm-backup-transform-filename-for-git filename))
+                                     helm-backup-path)))
     (make-directory directory t)
-    (copy-file filename directory t t t)))
+    (if (or (not helm-backup-use-hardlinks)
+            (file-remote-p filename))
+        (copy-file filename directory t t t)
+      (add-name-to-file filename (expand-file-name (file-name-nondirectory filename) directory) t))))
 
-(defun helm-backup-is-excluded-filename (filename)
+(defun helm-backup-get-backup-file-name (filename)
+  (expand-file-name (file-name-nondirectory filename)
+                    (concat helm-backup-path (file-name-directory filename))))
+
+(defun helm-backup-file-excluded-p (file)
   "Check if a FILENAME is excluded from backup."
-  (when filename
-    (dolist (regexp helm-backup-excluded-entries)
-      (let ((index (string-match (concat "^" regexp "$") filename)))
-        (when (and (integerp index)
-                   (zerop index))
-          (return
-           t))))))
+  (cl-some (lambda (regexp) (string-match-p (concat "\\`" regexp "\\'") file))
+           helm-backup-excluded-entries))
 
-(defun helm-backup-version-file (filename)
-  "Version file using FILENAME in backup repository."
+(defun helm-backup-version-file (filename &optional message force)
+  "Version file using FILENAME in backup repository.
+Return non-nil when a commit has been made."
+  (cl-callf or message "backup %s")
   (when (and filename
-             (helm-backup-is-absolute-filename filename)
+             (file-name-absolute-p filename)
              (file-exists-p filename)
-             (not (helm-backup-is-excluded-filename filename)))
+             (not (helm-backup-file-excluded-p filename)))
     (helm-backup-init-git-repository)
     (helm-backup-copy-file-to-repository filename)
-    (helm-backup-exec-git-command (list "add" (helm-backup-transform-filename-for-git filename)) t)
-    (helm-backup-exec-git-command '("commit" "-m" "backup") t)
-    t))
+    (let ((ref (helm-backup-get-ref filename)))
+      (helm-backup-in-backup-path
+       (let ((filename-for-git (helm-backup-transform-filename-for-git filename)))
+         (unless (helm-backup-exec-git-command "rev-parse" "--quiet" "--verify" ref)
+           ;; reset index and make initial void commit under ref
+           (helm-backup-exec-git-command "rm" "--cached" "*")
+           (helm-backup-exec-git-command
+            "update-ref" ref
+            (helm-backup-exec-git-command
+             "commit-tree"
+             "-m" (format "starting backing up in %s" ref)
+             (helm-backup-exec-git-command "write-tree"))))
+         ;; Prepare index.  Reset to appropriate head and add this file.
+         (helm-backup-exec-git-command "reset" ref)
+         (helm-backup-exec-git-command "add" filename-for-git)
+         (when (or force
+                   (= 1 (helm-backup-git-command-return-value
+                         "diff" "--quiet"
+                         ref "--" filename-for-git)))
+           (let ((parent (if force
+                             (nth 1 (split-string
+                                     (helm-backup-exec-git-command
+                                      "log" ref
+                                      "-2"
+                                      "--pretty=format:%H"
+                                      filename-for-git)
+                                     "\n"))
+                           ref)))
+             
+             (helm-backup-exec-git-command
+              "update-ref" ref
+              (helm-backup-exec-git-command
+               "commit-tree"
+               "-m" (format message (file-name-nondirectory filename))
+               "-p" parent
+               (helm-backup-exec-git-command "write-tree"))))
+           t))))))
+
+(defvar-local helm-backup--not-first-save-p nil)
+
+(defun helm-backup-before-save ()
+  "Backup before save."
+  (when (helm-backup-versioning
+         (concat "%s before save"
+                 (unless helm-backup--not-first-save-p
+                   " (new session)")))
+    (setq helm-backup--not-first-save-p t)))
+
+(defun helm-backup-after-save ()
+  "Backup after save."
+  (when (helm-backup-versioning
+         (concat "%s after save"
+                 (unless helm-backup--not-first-save-p
+                   " (new session)")))
+    (setq helm-backup--not-first-save-p t)))
+
+;;;###autoload
+(define-minor-mode helm-backup-mode ()
+  "Automatically backup files when saving.
+$$$FIXME."
+  :global t :group 'helm-backup
+  (if helm-backup-mode
+      (progn (add-hook 'after-save-hook  #'helm-backup-after-save)
+             (add-hook 'before-save-hook #'helm-backup-before-save))
+    (remove-hook 'after-save-hook  #'helm-backup-after-save)
+    (remove-hook 'before-save-hook #'helm-backup-before-save)))
 
 (defun helm-backup-list-file-change-time (filename)
   "Build assoc list using commit id and message rendering format using FILENAME."
-  (let ((filename-for-git (helm-backup-transform-filename-for-git filename)))
-    (when (and filename
-               (string= (helm-backup-exec-git-command (list "ls-files" filename-for-git) t)
-                        filename-for-git)
-               t)
-      (mapcar* 'cons (split-string (helm-backup-exec-git-command (list "log" (format
-                                                                              "--pretty=format:%s"
-                                                                              helm-backup-list-format)
-                                                                       filename-for-git) t) "\n")
-               (split-string (helm-backup-exec-git-command (list "log" "--pretty=format:%h"
-                                                                 filename-for-git) t) "\n")))))
+  (let ((ref (helm-backup-get-ref filename)))
+    (helm-backup-in-backup-path
+     (let ((filename-for-git (helm-backup-transform-filename-for-git filename)))
+       (cl-mapcar #'cons
+                  (split-string (helm-backup-exec-git-command "log"
+                                                              ref
+                                                              (format
+                                                               "--pretty=format:%s"
+                                                               helm-backup-list-format)
+                                                              "--date=local"
+                                                              filename-for-git)
+                                "\n")
+                  (split-string (helm-backup-exec-git-command "log"
+                                                              ref
+                                                              "--pretty=format:%h"
+                                                              filename-for-git)
+                                "\n"))))))
 
 (defun helm-backup-fetch-backup-file (commit-id filename)
   "Retrieve content file from backup repository using COMMIT-ID and FILENAME."
-  (let ((filename-for-git (helm-backup-transform-filename-for-git filename)))
-    (when (and commit-id
-               filename
-               (not (string= (helm-backup-exec-git-command (list "log" "--ignore-missing" "-1"
-                                                                 commit-id "--" filename-for-git) t)
-                             "")))
-      (helm-backup-exec-git-command (list "show" (concat commit-id ":" filename-for-git))))))
+  (helm-backup-in-backup-path
+   (let ((filename-for-git (helm-backup-transform-filename-for-git filename)))
+     (when (and commit-id
+                (not (string= (helm-backup-exec-git-command "log" "--ignore-missing" "-1"
+                                                            commit-id "--" filename-for-git)
+                              "")))
+       (helm-backup-exec-git-command "show" (concat commit-id ":" filename-for-git)
+                                     'keep-final-newline)))))
 
 (defun helm-backup-create-backup-buffer (commit-id filename)
   "Create a buffer using chosen backup using COMMIT-ID and FILENAME."
-  (let ((data (helm-backup-fetch-backup-file commit-id filename)))
-    (when data
-      (let ((buffer (get-buffer-create (concat filename " | " (helm-backup-exec-git-command (list
-                                                                                             "diff-tree"
-                                                                                             "-s"
-                                                                                             "--pretty=format:%cd"
-                                                                                             commit-id)
-                                                                                            t))))
-            (mode
-             (with-current-buffer (current-buffer)
-               major-mode)))
-        (with-current-buffer buffer
-          (erase-buffer)
-          (insert data)
-          (funcall mode)
-          buffer)))))
+  (helm-backup-in-backup-path
+   (when-let ((data (helm-backup-fetch-backup-file commit-id filename)))
+     (let ((buffer (get-buffer-create (concat filename " | " (helm-backup-exec-git-command
+                                                              "diff-tree"
+                                                              "-s"
+                                                              "--pretty=format:%cd"
+                                                              commit-id))))
+           (mode major-mode))
+       (with-current-buffer buffer
+         (erase-buffer)
+         (insert data)
+         (funcall mode)
+         (set-buffer-modified-p nil)
+         buffer)))))
 
-(defun helm-backup-clean-repository ()
+(defun helm-backup-clean-repository (&optional aggressive)
   "Clean repository running gc."
-  (helm-backup-exec-git-command (list "gc") t))
+  (interactive (list t))
+  (helm-backup-in-backup-path (apply #'helm-backup-exec-git-command
+                                     "gc"
+                                     (and aggressive '("--aggressive")))))
 
 ;;;###autoload
-(defun helm-backup-versioning ()
-  "Helper to add easily versionning."
-  (helm-backup-version-file (buffer-file-name)))
+(defun helm-backup-versioning (&optional message force)
+  "Helper to add easily versioning."
+  (interactive (list (read-string "Commit message: ") t))
+  (helm-backup-version-file (buffer-file-name) message force))
 
 (defun helm-backup-open-in-new-buffer (commit-id filename)
   "Open backup in new buffer using COMMIT-ID and FILENAME."
@@ -194,26 +311,41 @@
     (ediff-buffers (buffer-name backup-buffer)
                    (buffer-name buffer))))
 
+
+;;;; Helm interface
+
 (defun helm-backup-source ()
   "Source used to populate buffer."
-  `((name .
-          ,((lambda
-              ()
-              (format "Backup for %s" (buffer-file-name)))))
-    (candidates .
-                ,((lambda
-                    ()
-                    (helm-backup-list-file-change-time (buffer-file-name)))))
+  `((name . ,(let ((file (buffer-file-name)))
+               (format "Backup for %s under %s"
+                       (file-name-nondirectory file)
+                       (helm-backup-get-ref file))))
+    (candidates . ,(helm-backup-list-file-change-time (buffer-file-name)))
     (action ("Ediff file with backup" .
-             (lambda (candidate)
-               (helm-backup-create-ediff candidate (current-buffer))))
+             ,(lambda (candidate)
+                (helm-backup-create-ediff candidate (current-buffer))))
             ("Open in new buffer" .
-             (lambda (candidate)
-               (helm-backup-open-in-new-buffer candidate (buffer-file-name))))
+             ,(lambda (candidate)
+                (helm-backup-open-in-new-buffer candidate (buffer-file-name))))
             ("Replace current buffer" .
-             (lambda (candidate)
-               (with-helm-current-buffer
-                 (helm-backup-replace-current-buffer candidate (buffer-file-name))))))))
+             ,(lambda (candidate)
+                (with-helm-current-buffer
+                  (helm-backup-replace-current-buffer candidate (buffer-file-name))))))))
+
+(defclass helm-backup-source-find-file-in-repo (helm-source)
+  ((name :initform "Open backup repository")
+   (candidates :initform (lambda () (list (file-name-nondirectory (buffer-file-name helm-current-buffer)))))
+   (action :initform (("Open backup repository" .
+                       (lambda (_cand) (dired-jump t (helm-backup-get-backup-file-name
+                                                 (buffer-file-name helm-current-buffer))))))))
+  "Open/ediff against revisions and index of current file.")
+
+(defclass helm-backup-source-magit-log (helm-source)
+  ((name :initform "Open Log with Magit")
+   (candidates :initform '("Open Log with Magit"))
+   (action :initform (("Open log with Magit" .
+                       (lambda (_cand) (call-interactively #'magit-backup-magit-log))))))
+  "Open/ediff against revisions and index of current file.")
 
 ;;;###autoload
 (defun helm-backup ()
@@ -225,11 +357,40 @@
             "No filename associated with buffer, file has no backup yet or filename is blacklisted"))))
     (helm-other-buffer (helm-backup-source) "*Helm Backup*")))
 
-(eval-after-load "helm-backup"
-  '(progn
-     (helm-backup-clean-repository)))
+
+;;;; Magit log interface
+
+(defvar magit-backup-magit-log-log-args '("--date-order" "--graph" "--decorate"))
+
+;;;###autoload
+(defun magit-backup-magit-log (&optional refs args)
+  "Show backup log with Magit.
+With region active, show only commits changing the region lines."
+  (interactive
+   (progn
+     (require 'magit)
+     (helm-backup-in-backup-path
+      (list (list (helm-backup-get-ref (buffer-file-name)))))))
+  (require 'magit)
+  (let* ((file  (helm-backup-transform-filename-for-git (buffer-file-name)))
+         (L-arg (and (region-active-p)
+                     (format "-L%d,%d:%s"
+                             (line-number-at-pos (region-beginning))
+                             (line-number-at-pos (region-end))
+                             file))))
+    (helm-backup-in-backup-path
+     (magit-log
+      refs
+      (or args (if L-arg (apply #'list  L-arg "-p" magit-backup-magit-log-log-args)
+                 magit-backup-magit-log-log-args))
+      (list file)))))
+
+
+(helm-backup-clean-repository)
 
 (provide 'helm-backup)
+
+
 
 ;; Local Variables:
 ;; coding: utf-8
