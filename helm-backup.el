@@ -84,8 +84,6 @@
   :group 'helm-backup
   :type '(repeat regexp))
 
-(defvar magit-backup-respect-git-branches t)
-
 (defmacro helm-backup-in-backup-path (&rest body)
   (declare (debug t))
   `(let ((default-directory helm-backup-path))
@@ -115,14 +113,11 @@
 
 (defun helm-backup-get-ref (file)
   (let ((default-directory (file-name-directory file)))
-    (concat helm-backup-namespace
-            (or (and magit-backup-respect-git-branches
-                     (require 'vc nil t)
-                     (vc-git-registered file)
-                     (concat "brances/"
-                             (file-name-nondirectory
-                              (helm-backup-exec-git-command "symbolic-ref" "--quiet" "HEAD"))))
-                helm-backup-ref))))
+    (concat helm-backup-namespace helm-backup-ref)))
+
+(defun helm-backup-get-branch-name (&optional file)
+  (let ((default-directory (if file (file-name-directory file) default-directory)))
+    (file-name-nondirectory (helm-backup-exec-git-command "symbolic-ref" "--quiet" "HEAD"))))
 
 (defun helm-backup-verify-ref (ref)
   (helm-backup-in-backup-path
@@ -214,7 +209,7 @@ Return non-nil when a commit has been made."
 (defun helm-backup-before-save ()
   "Backup before save."
   (when (helm-backup-versioning
-         (concat "%s before save"
+         (concat "%s before save in " (helm-backup-get-branch-name)
                  (unless helm-backup--not-first-save-p
                    " (new session)")))
     (setq helm-backup--not-first-save-p t)))
@@ -222,7 +217,7 @@ Return non-nil when a commit has been made."
 (defun helm-backup-after-save ()
   "Backup after save."
   (when (helm-backup-versioning
-         (concat "%s after save"
+         (concat "%s after save in " (helm-backup-get-branch-name)
                  (unless helm-backup--not-first-save-p
                    " (new session)")))
     (setq helm-backup--not-first-save-p t)))
