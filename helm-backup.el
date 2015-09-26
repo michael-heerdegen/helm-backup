@@ -124,6 +124,10 @@
                               (helm-backup-exec-git-command "symbolic-ref" "--quiet" "HEAD"))))
                 helm-backup-ref))))
 
+(defun helm-backup-verify-ref (ref)
+  (helm-backup-in-backup-path
+   (helm-backup-exec-git-command "rev-parse" "--quiet" "--verify" ref)))
+
 (defun helm-backup-init-git-repository ()
   "Initialize git repository."
   (unless (file-directory-p helm-backup-path)
@@ -170,7 +174,7 @@ Return non-nil when a commit has been made."
     (let ((ref (helm-backup-get-ref filename)))
       (helm-backup-in-backup-path
        (let ((filename-for-git (helm-backup-transform-filename-for-git filename)))
-         (unless (helm-backup-exec-git-command "rev-parse" "--quiet" "--verify" ref)
+         (unless (helm-backup-verify-ref ref)
            ;; reset index and make initial void commit under ref
            (helm-backup-exec-git-command "rm" "--cached" "*")
            (helm-backup-exec-git-command
@@ -237,22 +241,23 @@ $$$FIXME."
 (defun helm-backup-list-file-change-time (filename)
   "Build assoc list using commit id and message rendering format using FILENAME."
   (let ((ref (helm-backup-get-ref filename)))
-    (helm-backup-in-backup-path
-     (let ((filename-for-git (helm-backup-transform-filename-for-git filename)))
-       (cl-mapcar #'cons
-                  (split-string (helm-backup-exec-git-command "log"
-                                                              ref
-                                                              (format
-                                                               "--pretty=format:%s"
-                                                               helm-backup-list-format)
-                                                              "--date=local"
-                                                              filename-for-git)
-                                "\n")
-                  (split-string (helm-backup-exec-git-command "log"
-                                                              ref
-                                                              "--pretty=format:%h"
-                                                              filename-for-git)
-                                "\n"))))))
+    (when (helm-backup-verify-ref ref)
+      (helm-backup-in-backup-path
+       (let ((filename-for-git (helm-backup-transform-filename-for-git filename)))
+         (cl-mapcar #'cons
+                    (split-string (helm-backup-exec-git-command "log"
+                                                                ref
+                                                                (format
+                                                                 "--pretty=format:%s"
+                                                                 helm-backup-list-format)
+                                                                "--date=local"
+                                                                filename-for-git)
+                                  "\n")
+                    (split-string (helm-backup-exec-git-command "log"
+                                                                ref
+                                                                "--pretty=format:%h"
+                                                                filename-for-git)
+                                  "\n")))))))
 
 (defun helm-backup-fetch-backup-file (commit-id filename)
   "Retrieve content file from backup repository using COMMIT-ID and FILENAME."
