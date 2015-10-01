@@ -151,9 +151,9 @@
   (expand-file-name (file-name-nondirectory filename)
                     (concat helm-backup-path (file-name-directory filename))))
 
-(defun helm-backup-file-excluded-p (file)
+(defun helm-backup-file-excluded-p (filename)
   "Check if a FILENAME is excluded from backup."
-  (cl-some (lambda (regexp) (string-match-p (concat "\\`" regexp "\\'") file))
+  (cl-some (lambda (regexp) (string-match-p (concat "\\`" regexp "\\'") filename))
            helm-backup-excluded-entries))
 
 (defun helm-backup-version-file (filename &optional message force)
