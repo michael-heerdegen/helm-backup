@@ -48,6 +48,7 @@
 (require 'helm)
 (require 'helm-utils)
 (require 'cl-lib)
+(require 's)
 
 
 (defgroup helm-backup nil
@@ -89,10 +90,6 @@
   `(let ((default-directory helm-backup-path))
      ,@body))
 
-(defun magit-backup--strip-final-newline (output)
-  (string-match (rx bos (group (*? anything)) (* (any "\n\r")) eos) output)
-  (match-string 1 output)  )
-
 (defun helm-backup-exec-git-command (command &rest args)
   "Execute git COMMAND and return result string, nil if failed."
   (let ((keep-final-newline nil))
@@ -105,7 +102,7 @@
                            (buffer-string)))))
       (if keep-final-newline
           output
-        (magit-backup--strip-final-newline output)))))
+        (s-chomp output)))))
 
 (defun helm-backup-git-command-return-value (command &rest args)
   (helm-backup-in-backup-path
